@@ -39,3 +39,15 @@
 
 # debug information files
 *.dwo
+
+# Large ultrasound RF data files
+testcase/*.DAT
+*.dat
+
+# Build artifacts
+sequential/ultrasound
+sequential/validate
+sequential/beam_*.dat
+
+# System files
+.DS_Store

@@ -1,0 +1,8 @@
+Nchan=128
+fs=13.8889
+fc=3.5
+timeoffset=34.056
+Nsample=2048
+bytes_per_sample=2
+pitch=0.22
+soundv=1.54
