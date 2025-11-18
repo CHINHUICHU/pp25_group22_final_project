@@ -56,7 +56,13 @@ make clean
 - **Output**: `../result/imageXX.png` (final ultrasound image)
 - **Validation**: `../truth/XX.png` (ground truth images)
 
-**Note**: The large RF data files (*.DAT) are excluded from the repository due to GitHub's file size limits. You'll need to obtain these files separately to run the test cases.
+**Note**: The large RF data files (*.DAT) are excluded from the repository due to GitHub's file size limits. Use the setup script to download and extract them:
+
+```bash
+./download_testdata.sh
+```
+
+This will download compressed files from Google Drive and extract them to the testcase/ directory.
 
 ## Key Parameters
 
