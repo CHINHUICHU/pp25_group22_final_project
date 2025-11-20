@@ -20,44 +20,47 @@ if [[ -f "testcase/01.DAT" && -f "testcase/02.DAT" && -f "testcase/03.DAT" ]]; t
     exit 0
 fi
 
+# Google Drive folder URL
+FOLDER_URL="https://drive.google.com/drive/folders/1F_RahQIT6tuCRNcDl9DlWDhvaqT2ju2c"
+
 echo "Downloading compressed RF data files from Google Drive..."
-echo "Source: https://drive.google.com/drive/folders/1F_RahQIT6tuCRNcDl9DlWDhvaqT2ju2c"
+echo "Source: $FOLDER_URL"
 echo ""
 
-# Function to download file from Google Drive
-download_gdrive() {
-    local file_id="$1"
-    local output_file="$2"
+# Check if gdown is available
+if ! command -v gdown &> /dev/null && ! python3 -c "import gdown" 2>/dev/null; then
+    echo "Installing gdown..."
+    pip3 install --user gdown 'beautifulsoup4<4.12' 2>/dev/null || {
+        echo "❌ Failed to install gdown. Please install manually:"
+        echo "   pip3 install --user gdown 'beautifulsoup4<4.12'"
+        echo ""
+        echo "Or download manually from: $FOLDER_URL"
+        exit 1
+    }
+fi
 
-    echo "Downloading $output_file..."
-    curl -L "https://drive.google.com/uc?export=download&id=$file_id" -o "$output_file"
+# Find gdown executable
+GDOWN_CMD=""
+if command -v gdown &> /dev/null; then
+    GDOWN_CMD="gdown"
+elif [[ -f "$HOME/.local/bin/gdown" ]]; then
+    GDOWN_CMD="$HOME/.local/bin/gdown"
+else
+    echo "❌ gdown not found in PATH. Please add ~/.local/bin to PATH or reinstall gdown."
+    exit 1
+fi
 
-    if [[ ! -f "$output_file" ]]; then
-        echo "❌ Failed to download $output_file"
-        return 1
-    fi
-    echo "✓ Downloaded $output_file ($(du -h "$output_file" | cut -f1))"
-}
+# Download folder using gdown
+echo "Using gdown to download folder..."
+$GDOWN_CMD --folder "$FOLDER_URL" -O testcase/
 
-# Download compressed files (you'll need to replace these file IDs with actual ones from your Google Drive)
-echo "Note: You need to get the actual Google Drive file IDs and update this script."
-echo ""
-echo "To get file IDs from Google Drive:"
-echo "1. Right-click each .bz2 file in Google Drive"
-echo "2. Select 'Get link' and copy the file ID from the URL"
-echo "3. Update the file IDs in this script"
-echo ""
-echo "Manual download instructions:"
-echo "1. Visit: https://drive.google.com/drive/folders/1F_RahQIT6tuCRNcDl9DlWDhvaqT2ju2c"
-echo "2. Download 01.DAT.bz2, 02.DAT.bz2, 03.DAT.bz2 to testcase/ directory"
-echo "3. Run: bunzip2 testcase/*.bz2"
+# Move files from subdirectory if created
+if [[ -d "testcase/pp25_final_testcases" ]]; then
+    mv testcase/pp25_final_testcases/*.bz2 testcase/ 2>/dev/null || true
+    rmdir testcase/pp25_final_testcases 2>/dev/null || true
+fi
 
-# Uncomment and update file IDs when available:
-# download_gdrive "FILE_ID_FOR_01_DAT_BZ2" "testcase/01.DAT.bz2"
-# download_gdrive "FILE_ID_FOR_02_DAT_BZ2" "testcase/02.DAT.bz2"
-# download_gdrive "FILE_ID_FOR_03_DAT_BZ2" "testcase/03.DAT.bz2"
-
-# Check if compressed files exist (manual download)
+# Check if compressed files exist
 if [[ -f "testcase/01.DAT.bz2" && -f "testcase/02.DAT.bz2" && -f "testcase/03.DAT.bz2" ]]; then
     echo ""
     echo "Found compressed files, extracting..."
@@ -89,10 +92,9 @@ if [[ -f "testcase/01.DAT.bz2" && -f "testcase/02.DAT.bz2" && -f "testcase/03.DA
 
 else
     echo ""
-    echo "❌ Compressed files not found. Please download manually:"
-    echo "1. Visit the Google Drive link above"
-    echo "2. Download all .bz2 files to testcase/ directory"
-    echo "3. Run this script again"
+    echo "❌ Download failed. Compressed files not found."
+    echo "Please try downloading manually from: $FOLDER_URL"
+    exit 1
 fi
 
 echo "=========================================="
