@@ -93,7 +93,11 @@ int main(int argc, char** argv)
 
     // 3) Bandpass FIR (1.5–6 MHz, 41-tap)
     cout << "[Main] Applying 41-tap bandpass (1.5–6 MHz)...\n";
-    bandpass_apply_all(rf, p.Nchan, p.Nsample);
+    bandpass_apply_all(rf, p.Nchan, p.Nsample,
+                   p.fs,                 // MHz
+                   p.has_bp,
+                   p.bp_low,            // MHz
+                   p.bp_high);
 
     // 4) Beamforming
     run_beamform(rf, p, beam_file);

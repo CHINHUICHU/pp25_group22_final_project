@@ -1,4 +1,3 @@
-// params.cpp
 #include "params.h"
 #include <fstream>
 #include <sstream>
@@ -45,13 +44,23 @@ BFParams load_params(const char* filename)
         string val = trim(line.substr(pos + 1));
 
         if (key == "Nchan")             p.Nchan = stoi(val);
-        else if (key == "fs")          p.fs = stof(val);
-        else if (key == "fc")          p.fc = stof(val);
-        else if (key == "timeoffset")  p.timeoffset = stof(val);
-        else if (key == "Nsample")     p.Nsample = stoi(val);
+        else if (key == "fs")           p.fs = stof(val);
+        else if (key == "fc")           p.fc = stof(val);
+        else if (key == "timeoffset")   p.timeoffset = stof(val);
+        else if (key == "Nsample")      p.Nsample = stoi(val);
         else if (key == "bytes_per_sample") p.bytes_per_sample = stoi(val);
-        else if (key == "pitch")       p.pitch = stof(val);
-        else if (key == "soundv")      p.soundv = stof(val);
+        else if (key == "pitch")        p.pitch = stof(val);
+        else if (key == "soundv")       p.soundv = stof(val);
+
+        // ---- 新增的兩個 fields ----
+        else if (key == "bandpass_low") {
+            p.bp_low = stof(val);
+            p.has_bp = true;
+        }
+        else if (key == "bandpass_high") {
+            p.bp_high = stof(val);
+            p.has_bp = true;
+        }
     }
 
     cout << "[Params] Loaded from " << filename << ":\n";
@@ -62,8 +71,14 @@ BFParams load_params(const char* filename)
     cout << "  Nsample         = " << p.Nsample << "\n";
     cout << "  bytes_per_sample= " << p.bytes_per_sample << "\n";
     cout << "  pitch (mm)      = " << p.pitch << "\n";
-    cout << "  soundv (mm/us)  = " << p.soundv << "\n\n";
+    cout << "  soundv (mm/us)  = " << p.soundv << "\n";
+
+    if (p.has_bp) {
+        cout << "  Custom bandpass = "
+             << p.bp_low << " – " << p.bp_high << " Hz\n\n";
+    } else {
+        cout << "  Bandpass        = default 41-tap (1.5–6 MHz)\n\n";
+    }
 
     return p;
 }
-
