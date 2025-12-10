@@ -61,13 +61,16 @@ if [[ -d "testcase/pp25_final_testcases" ]]; then
 fi
 
 # Check if compressed files exist
-if [[ -f "testcase/01.DAT.bz2" && -f "testcase/02.DAT.bz2" && -f "testcase/03.DAT.bz2" ]]; then
+if [[ -f "testcase/01.DAT.bz2" && -f "testcase/02.DAT.bz2" && -f "testcase/03.DAT.bz2" && -f "testcase/04.DAT.bz2" && -f "testcase/05.DAT.bz2" && -f "testcase/06.DAT.bz2" ]]; then
     echo ""
     echo "Found compressed files, extracting..."
 
     bunzip2 testcase/01.DAT.bz2
     bunzip2 testcase/02.DAT.bz2
     bunzip2 testcase/03.DAT.bz2
+    bunzip2 testcase/04.DAT.bz2
+    bunzip2 testcase/05.DAT.bz2
+    bunzip2 testcase/06.DAT.bz2
 
     echo "✓ Extraction complete!"
     echo ""

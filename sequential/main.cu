@@ -1,10 +1,10 @@
 /**
- * Ultrasound Beamforming Pipeline (Timing + Debug + Fix)
- * 功能：
- * 1. [Timing] 輸出每一步驟的執行時間 (ms)。
- * 2. [Fix] 修復 RF 資料讀取格式 (int32 -> float)，解決 nan 問題。
- * 3. [Debug] 檢查每一步驟的訊號強度。
- * 4. [Robust] 使用 Global Memory 傳遞常數。
+ * Ultrasound Beamforming Pipeline (Final Fix: Padding Alignment)
+ * * 修復項目：
+ * 1. [CRITICAL] 修正 Beamforming 插值索引偏移 (Padding Offset -4)。
+ * 這解決了 CPU 與 GPU 結果錯位導致的低 PSNR 問題。
+ * 2. 包含之前的 nan 資料讀取修復。
+ * 3. 包含 Global Memory 常數優化。
  */
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -20,14 +20,14 @@
 #include <string>
 #include <cmath>
 #include <algorithm>
-#include <chrono> // 用於計時
+#include <chrono>
 #include <iomanip>
 
 using namespace std;
 using namespace std::chrono;
 
 // =========================================================
-// 0. CUDA Helper & Debug Tools
+// 0. CUDA Helper
 // =========================================================
 #define checkCuda(ans) { gpuAssert((ans), __FILE__, __LINE__); }
 inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true) {
@@ -37,26 +37,8 @@ inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=t
    }
 }
 
-// 檢查訊號健康度 (Debug用)
-void check_signal_health(float* d_data, int N, string stage_name) {
-    thrust::device_ptr<float> ptr(d_data);
-    float max_val = *thrust::max_element(ptr, ptr + N);
-    float min_val = *thrust::min_element(ptr, ptr + N);
-    float abs_max = max(abs(max_val), abs(min_val));
-
-    // 使用 \r 讓進度條或訊息看起來整齊，但在這裡我們直接印出
-    // cout << "  [DEBUG] " << left << setw(15) << stage_name 
-    //      << " | Range: [" << min_val << ", " << max_val << "]" << endl;
-
-    if (isnan(abs_max)) {
-        cout << "  \033[1;31m[ERROR] " << stage_name << " produced NaN values!\033[0m" << endl;
-    } else if (abs_max == 0.0f) {
-        cout << "  \033[1;33m[WARN]  " << stage_name << " produced All Zeros!\033[0m" << endl;
-    }
-}
-
 // =========================================================
-// 1. Structures
+// 1. Structures & Params
 // =========================================================
 struct BFParams {
     int   Nchan;
@@ -79,10 +61,7 @@ static string trim(const string& s) {
 BFParams load_params(const char* filename) {
     BFParams p = {128, 13.8889f, 3.5f, 29.448f, 2048, 2, 0.22f, 1.48f}; 
     ifstream fin(filename);
-    if (!fin) {
-        cout << "[WARN] Params file not found, using defaults.\n";
-        return p;
-    }
+    if (!fin) return p;
     string line;
     while (getline(fin, line)) {
         line = trim(line);
@@ -103,29 +82,22 @@ BFParams load_params(const char* filename) {
     return p;
 }
 
-// [FIXED] 修正後的讀檔函式：正確處理 32-bit int -> float
 float* load_rf_flattened(const char* filename, const BFParams& p) {
     size_t total_elements = (size_t)p.Nchan * p.Nchan * p.Nsample;
     float* data = new float[total_elements];
-    
     ifstream fin(filename, ios::binary | ios::ate);
-    if (!fin) { cerr << "[ERROR] Cannot open RF file: " << filename << endl; exit(1); }
-    
+    if (!fin) { cerr << "[ERROR] Cannot open RF file." << endl; exit(1); }
     fin.seekg(0, ios::beg);
 
     if (p.bytes_per_sample == 2) {
         vector<short> tmp(total_elements);
         fin.read((char*)tmp.data(), total_elements * sizeof(short));
         for(size_t i=0; i<total_elements; ++i) data[i] = (float)tmp[i];
-    } 
-    else if (p.bytes_per_sample == 4) {
-        // [FIX] 讀取 int32 並轉型為 float (解決 nan 問題)
+    } else if (p.bytes_per_sample == 4) {
         vector<int32_t> tmp(total_elements);
         fin.read((char*)tmp.data(), total_elements * sizeof(int32_t));
         for(size_t i=0; i<total_elements; ++i) data[i] = (float)tmp[i];
-    } 
-    else {
-        // Fallback
+    } else {
         fin.read((char*)data, total_elements * sizeof(float));
     }
     return data;
@@ -150,6 +122,7 @@ __global__ void k_bandpass(
     d_out[idx] = (float)acc;
 }
 
+// [CRITICAL FIX HERE]
 __global__ void k_beamform(
     const float* __restrict__ d_rf, float* __restrict__ d_beam,
     const float* __restrict__ d_XChan, const float* __restrict__ d_Interp,
@@ -189,9 +162,15 @@ __global__ void k_beamform(
                 int nn = idx_up % upsamp; 
                 float val = 0.0f;
                 int rf_base = (tx * Nchan + rx) * Nsample;
+                
+                // [FIX] 8-tap Interpolation Logic
+                // CPU logic: buff[k+4] = rf[k]. Then access buff[mm]. 
+                // effectively rf[mm - 4].
+                // So sample_idx = mm + k - 4;
                 for (int k = 0; k < 9; k++) {
-                    int sample_idx = mm + k;
+                    int sample_idx = mm + k - 4; // <--- The Critical Fix (-4 offset)
                     int weight_idx = nn + (8 - k) * 8;
+                    
                     if (sample_idx >= 0 && sample_idx < Nsample) {
                         val += d_rf[rf_base + sample_idx] * d_Interp[weight_idx];
                     }
@@ -256,6 +235,8 @@ __global__ void k_scan_convert(
     float b_f = s / dsin + (Nbeam_f + 1)/2.0f - 1.0f;
     float d_f = (r - rangeoffset) / drange;
 
+    // Texture Sample (Linear Interp)
+    // Note: We use d_f + 0.5f to target pixel centers, matching CPU logic essentially
     float val_db = tex2D<float>(tex_beam, d_f + 0.5f, b_f + 0.5f);
     float gray = (val_db + DR) / DR;
     if (gray < 0.0f) gray = 0.0f;
@@ -267,7 +248,7 @@ __global__ void k_scan_convert(
 // 3. Main
 // =========================================================
 int main(int argc, char** argv) {
-    cudaFree(0); // 強制驅動程式現在就初始化 Context
+    cudaFree(0); // Init Context
     auto total_pipeline_start = high_resolution_clock::now();
 
     if (argc != 5) {
@@ -277,36 +258,26 @@ int main(int argc, char** argv) {
 
     const char* rf_file = argv[1];
     const char* param_file = argv[2];
+    const char* beam_file = argv[3];
     const char* png_file = argv[4];
 
-    // --- 1. Load Params ---
     BFParams p = load_params(param_file);
     size_t rf_elements = (size_t)p.Nchan * p.Nchan * p.Nsample;
     size_t rf_size = rf_elements * sizeof(float);
 
-    cout << "===== Ultrasound GPU Pipeline (With Timing) =====" << endl;
-    cout << "Params: Nchan=" << p.Nchan << " Nsample=" << p.Nsample << " fs=" << p.fs << endl;
-
-    // --- 2. Load RF & Host Constants ---
-    // [FIX] 這裡會使用修正後的 load_rf_flattened
+    cout << "===== Ultrasound GPU Pipeline (Final Fix) =====" << endl;
+    
+    // Load RF
     float* h_rf = load_rf_flattened(rf_file, p);
     
-    // Check RF Health
-    {
-        float max_h = 0.0f;
-        for(size_t i=0; i<rf_elements; i++) if(abs(h_rf[i]) > max_h) max_h = abs(h_rf[i]);
-        if(isnan(max_h)) { cerr << "[ERROR] Input RF data contains NaN!" << endl; return -1; }
-        // cout << "  [DEBUG] Host RF Max: " << max_h << endl;
-    }
-
-    // --- 3. GPU Allocation ---
+    // GPU Alloc
     float *d_rf_in, *d_rf_bp;
     checkCuda(cudaMalloc(&d_rf_in, rf_size));
     checkCuda(cudaMalloc(&d_rf_bp, rf_size));
     checkCuda(cudaMemcpy(d_rf_in, h_rf, rf_size, cudaMemcpyHostToDevice));
     delete[] h_rf;
 
-    // --- Constants Setup ---
+    // Constants
     float h_FIR[41] = {-0.002056037f, 0.000924852f, -0.001163920f, 0.004113509f, 0.001553636f, 0.003690527f, 0.002282456f, -0.010000161f, -0.000456886f, -0.026071766f, 0.007272336f, -0.010216734f, 0.027880677f, 0.039142416f, 0.010970782f, 0.060208140f, -0.101972141f, 0.006518833f, -0.269375890f, -0.067515217f, 0.647999482f, -0.067515217f, -0.269375890f, 0.006518833f, -0.101972141f, 0.060208140f, 0.010970782f, 0.039142416f, 0.027880677f, -0.010216734f, 0.007272336f, -0.026071766f, -0.000456886f, -0.010000161f, 0.002282456f, 0.003690527f, 0.001553636f, 0.004113509f, -0.001163920f, 0.000924852f, -0.002056037f};
     vector<float> vec_XChan(p.Nchan);
     for(int i=0; i<p.Nchan; ++i) vec_XChan[i] = (i + 1 - (p.Nchan + 1) / 2.0f) * p.pitch;
@@ -320,24 +291,17 @@ int main(int argc, char** argv) {
     checkCuda(cudaMalloc(&d_Interp, 72 * sizeof(float)));
     checkCuda(cudaMemcpy(d_Interp, h_Interp, 72 * sizeof(float), cudaMemcpyHostToDevice));
 
-    // ==========================================
-    // STEP 1: Bandpass
-    // ==========================================
+    // --- Bandpass ---
     auto t0 = high_resolution_clock::now();
     int blockSize = 256;
     int numBlocks = (rf_elements + blockSize - 1) / blockSize;
     k_bandpass<<<numBlocks, blockSize>>>(d_rf_in, d_rf_bp, d_FIR, rf_elements, p.Nsample);
-    checkCuda(cudaDeviceSynchronize()); // Wait for kernel
+    checkCuda(cudaDeviceSynchronize());
     auto t1 = high_resolution_clock::now();
-    
-    double time_bp = duration<double, milli>(t1 - t0).count();
-    printf("  [Time] Bandpass:         %7.2f ms\n", time_bp);
-    check_signal_health(d_rf_bp, rf_elements, "Bandpass");
+    printf("  [Time] Bandpass:         %7.2f ms\n", duration<double, milli>(t1 - t0).count());
     checkCuda(cudaFree(d_rf_in));
 
-    // ==========================================
-    // STEP 2: Beamforming
-    // ==========================================
+    // --- Beamforming ---
     float apersize = p.Nchan * p.pitch;
     float lambda   = p.soundv / p.fc;
     float dsin     = lambda / apersize / 2.0f;
@@ -355,17 +319,19 @@ int main(int argc, char** argv) {
     dim3 bf_block(256, 1);
     dim3 bf_grid((UNsample + 255)/256, Nbeam);
     k_beamform<<<bf_grid, bf_block>>>(d_rf_bp, d_beam, d_XChan, d_Interp, Nbeam, UNsample, p.Nsample, p.Nchan, dsin, rangeoffset, drange, p.soundv, p.fs, p.timeoffset);
-    checkCuda(cudaDeviceSynchronize()); // Wait for kernel
+    checkCuda(cudaDeviceSynchronize());
     t1 = high_resolution_clock::now();
-
-    double time_bf = duration<double, milli>(t1 - t0).count();
-    printf("  [Time] Beamforming:      %7.2f ms\n", time_bf);
-    check_signal_health(d_beam, beam_elements, "Beamform");
+    printf("  [Time] Beamforming:      %7.2f ms\n", duration<double, milli>(t1 - t0).count());
     checkCuda(cudaFree(d_rf_bp));
 
-    // ==========================================
-    // STEP 3: Envelope & Log
-    // ==========================================
+    // Save Beam
+    float* h_beam = new float[beam_elements];
+    checkCuda(cudaMemcpy(h_beam, d_beam, beam_size, cudaMemcpyDeviceToHost));
+    ofstream fout(beam_file, ios::binary);
+    if(fout) { fout.write((char*)h_beam, beam_size); fout.close(); }
+    delete[] h_beam;
+
+    // --- Envelope & Log ---
     float* d_env;
     checkCuda(cudaMalloc(&d_env, beam_size));
     int env_blocks = (beam_elements + 255) / 256;
@@ -376,17 +342,12 @@ int main(int argc, char** argv) {
     float max_val = *thrust::max_element(t_ptr, t_ptr + beam_elements);
     if (max_val < 1e-6f) max_val = 1.0f;
     k_log_compress<<<env_blocks, 256>>>(d_env, beam_elements, max_val, 60.0f);
-    checkCuda(cudaDeviceSynchronize()); // Wait for kernel
+    checkCuda(cudaDeviceSynchronize());
     t1 = high_resolution_clock::now();
-
-    double time_env = duration<double, milli>(t1 - t0).count();
-    printf("  [Time] Envelope & Log:   %7.2f ms\n", time_env);
-    check_signal_health(d_env, beam_elements, "Envelope");
+    printf("  [Time] Envelope & Log:   %7.2f ms\n", duration<double, milli>(t1 - t0).count());
     checkCuda(cudaFree(d_beam));
 
-    // ==========================================
-    // STEP 4: Scan Conversion
-    // ==========================================
+    // --- Scan Conversion ---
     cudaArray* cuArray;
     cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc<float>();
     checkCuda(cudaMallocArray(&cuArray, &channelDesc, UNsample, Nbeam));
@@ -411,28 +372,22 @@ int main(int argc, char** argv) {
     dim3 sc_block(16, 16);
     dim3 sc_grid((outW+15)/16, (outH+15)/16);
     k_scan_convert<<<sc_grid, sc_block>>>(tex_beam, d_img, outW, outH, x_max, rangeoffset, r_max, theta_max, dsin, (float)Nbeam, (float)UNsample, rangeoffset, drange, 60.0f);
-    checkCuda(cudaDeviceSynchronize()); // Wait for kernel
+    checkCuda(cudaDeviceSynchronize());
     t1 = high_resolution_clock::now();
+    printf("  [Time] Scan Conversion:  %7.2f ms\n", duration<double, milli>(t1 - t0).count());
 
-    double time_sc = duration<double, milli>(t1 - t0).count();
-    printf("  [Time] Scan Conversion:  %7.2f ms\n", time_sc);
-
-    // Save
     vector<unsigned char> h_img(outW * outH);
     checkCuda(cudaMemcpy(h_img.data(), d_img, outW * outH, cudaMemcpyDeviceToHost));
     if (stbi_write_png(png_file, outW, outH, 1, h_img.data(), outW))
         cout << "[System] Saved PNG: " << png_file << endl;
 
-    // Cleanup
     cudaFree(d_env); cudaFree(d_img); cudaFree(d_FIR); cudaFree(d_XChan); cudaFree(d_Interp);
     cudaFreeArray(cuArray); cudaDestroyTextureObject(tex_beam);
 
     auto total_pipeline_end = high_resolution_clock::now();
-    double time_total = duration<double, milli>(total_pipeline_end - total_pipeline_start).count();
-
-    cout << "=======================================" << endl;
-    printf("  [Time] TOTAL EXECUTION:  %7.2f ms\n", time_total);
-    cout << "=======================================" << endl;
+    printf("=======================================\n");
+    printf("  [Time] TOTAL EXECUTION:  %7.2f ms\n", duration<double, milli>(total_pipeline_end - total_pipeline_start).count());
+    printf("=======================================\n");
 
     return 0;
 }
