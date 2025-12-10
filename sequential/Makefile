@@ -1,27 +1,29 @@
 # ============================================
-#   Ultrasound Reconstruction (sequential version)
-#   All source files in current folder
+#   Ultrasound Reconstruction (CUDA Version)
+#   Source file: main.cu
 #   Testcases located in ../testcase/
 #   Output images in ../result/
 # ============================================
 
-CXX      = g++
-CXXFLAGS = -O3 -std=c++17 -Wall -Wno-unused-variable
+# 設定 CUDA 編譯器
+NVCC      = nvcc
 
-SRCS  = main.cpp params.cpp bandpass.cpp beamform.cpp scan_convert.cpp
-OBJS  = $(SRCS:.cpp=.o)
-TARGET = ultrasound
+# 編譯參數：
+# -O3: 最高級別優化
+# -std=c++17: 使用 C++17 標準
+# -Xcompiler: 將後面的參數傳給底層的 C++ 編譯器 (如 gcc/g++)
+NVCCFLAGS = -O3 -std=c++17 -Xcompiler "-Wall -Wno-unused-variable"
 
-# --- Validation tool ---
-VALIDATE_SRC = validate.cpp
-VALIDATE_OBJ = $(VALIDATE_SRC:.cpp=.o)
-VALIDATE_EXE = validate
+# 檔案設定
+SRCS    = main.cu
+OBJS    = $(SRCS:.cu=.o)
+TARGET  = ultrasound_gpu
 
-# --- User variables ---
+# --- 使用者變數 (預設跑 CASE 01) ---
 CASE ?= 01
-OUT  ?= output.png
+OUT  ?= output_gpu.png
 
-# --- Paths ---
+# --- 路徑設定 (維持與 CPU 版一致) ---
 TESTDATA  = ../testcase/$(CASE).DAT
 TESTPARAM = ../testcase/$(CASE).txt
 TESTBEAM  = beam_$(CASE).dat
@@ -29,40 +31,31 @@ RESULTDIR = ../result
 TESTPNG   = $(RESULTDIR)/$(OUT)
 
 # ============================================
-# Build
+# Build Rules
 # ============================================
-all: $(TARGET) $(VALIDATE_EXE)
+all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $(OBJS)
+	$(NVCC) $(NVCCFLAGS) -o $(TARGET) $(OBJS)
 
-$(VALIDATE_EXE): $(VALIDATE_OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $(VALIDATE_OBJ)
-
-%.o: %.cpp
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+# 編譯 .cu 檔案為 .o
+%.o: %.cu
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
 # ============================================
-# Run (output PNG into ../result/)
+# Run
 # Usage:
-#   make run CASE=01 OUT=img01.png
+#   make run
+#   make run CASE=02 OUT=image02.png
 # ============================================
 run: $(TARGET)
 	mkdir -p $(RESULTDIR)
 	./$(TARGET) $(TESTDATA) $(TESTPARAM) $(TESTBEAM) $(TESTPNG)
 
 # ============================================
-# Validate result
-# Usage:
-#   make check CASE=01 OUT=img01.png
-# ============================================
-check: $(VALIDATE_EXE)
-	./$(VALIDATE_EXE) $(RESULTDIR)/$(OUT) ../truth/$(CASE).png
-
-# ============================================
 # Clean
 # ============================================
 clean:
-	rm -f $(OBJS) $(TARGET) $(VALIDATE_OBJ) $(VALIDATE_EXE) beam_*.dat
+	rm -f $(OBJS) $(TARGET) beam_*.dat
 
-.PHONY: all run clean check
+.PHONY: all run clean
