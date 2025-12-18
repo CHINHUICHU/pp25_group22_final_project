@@ -7,7 +7,7 @@ CXX      = g++
 CXXFLAGS = -O3 -std=c++17 -Wall -Wno-unused-variable
 
 NVCC      = nvcc
-NVCCFLAGS = -O3 -std=c++17 -lineinfo -arch=sm_70
+NVCCFLAGS = -O3 -std=c++17
 
 # -------------------------
 # Source files
