@@ -8,6 +8,12 @@
 // 2. Shared Memory: xchan loaded into shared memory for fast access
 // 3. Memory Coalescing: Adjacent threads read adjacent pixels
 // 4. Strict Math: Standard sqrtf (No fast_math approximations)
+// 5. Loop Tiling: Tx loop tiled into chunks (16 Tx at a time)
+//    - Reduces register pressure from 128×128 nested loops
+//    - Enables shared memory caching of Tx geometry data
+// 6. Multiple Pixels per Thread: Each thread handles 2 pixels
+//    - Amortizes Tx geometry calculations across pixels
+//    - Better register reuse
 // ============================================================
 
 #include <cstdio>
@@ -38,14 +44,18 @@ static inline void checkCuda(cudaError_t e, const char* msg)
 }
 
 // ============================================================
-// Kernel: Pixel-Parallel Beamforming
+// Kernel: Pixel-Parallel Beamforming with Loop Tiling
 //
 // Grid: (pixel_tiles)
 // Block: (BLOCK_SIZE)
 //
-// Each thread computes the FULL sum for one pixel (jGlobal).
+// Each thread computes TWO pixels to amortize Tx geometry calculations.
+// Tx loop is tiled into chunks of TX_TILE_SIZE to reduce register pressure.
 // No atomics needed - direct write to d_beam[jGlobal].
 // ============================================================
+#define TX_TILE_SIZE 16
+#define PIXELS_PER_THREAD 2
+
 __global__ __launch_bounds__(256)
 void beamform_pixel_parallel_kernel(
     const float* __restrict__ rf_transposed, // [Tx][Sample][Rx]
@@ -66,85 +76,134 @@ void beamform_pixel_parallel_kernel(
     // Load xchan into shared memory for fast repeated access
     __shared__ float s_xchan[128];
 
+    // Shared memory for Tx geometry data within a tile
+    __shared__ float s_tx_x[TX_TILE_SIZE];
+
     int tid = threadIdx.x;
     if (tid < Nchan) {
         s_xchan[tid] = xchan[tid];
     }
     __syncthreads();
 
-    // Each thread handles one pixel
-    int jGlobal = blockIdx.x * blockDim.x + threadIdx.x;
-    if (jGlobal >= UNsample) return;
+    // Each thread handles PIXELS_PER_THREAD pixels
+    int pixel_base = (blockIdx.x * blockDim.x + threadIdx.x) * PIXELS_PER_THREAD;
+
+    // Pre-compute geometry for all pixels this thread handles
+    float px[PIXELS_PER_THREAD];
+    float pz[PIXELS_PER_THREAD];
+    bool valid[PIXELS_PER_THREAD];
+
+    #pragma unroll
+    for (int p = 0; p < PIXELS_PER_THREAD; ++p) {
+        int jGlobal = pixel_base + p;
+        valid[p] = (jGlobal < UNsample);
+
+        if (valid[p]) {
+            float depth = rangeoffset + jGlobal * drange;
+            px[p] = depth * sint;
+            pz[p] = depth * cost;
+        }
+    }
+
+    // Accumulation arrays for each pixel
+    float total_sum[PIXELS_PER_THREAD] = {0.0f};
 
     // --------------------------------------------------------
-    // Geometry for this pixel
+    // Tiled loop over Tx (process TX_TILE_SIZE Tx at a time)
     // --------------------------------------------------------
-    float depth = rangeoffset + jGlobal * drange;
-    float px    = depth * sint;
-    float pz    = depth * cost;
-
-    float total_sum = 0.0f;
-
-    // --------------------------------------------------------
-    // Loop over ALL Tx and Rx (no atomics needed!)
-    // --------------------------------------------------------
-    for (int tx = 0; tx < Nchan; ++tx)
+    for (int tx_tile = 0; tx_tile < Nchan; tx_tile += TX_TILE_SIZE)
     {
-        // Tx geometry (computed once per Tx)
-        float x_tx  = s_xchan[tx];
-        float dx_tx = px - x_tx;
-        float d_tx  = rsqrtf(dx_tx * dx_tx + pz * pz);
+        int tx_count = min(TX_TILE_SIZE, Nchan - tx_tile);
 
-        // Base pointer for this Tx: rf_transposed[tx][sample][rx]
-        const float* tx_rf_base = rf_transposed + (size_t)tx * Nsample * Nchan;
+        // Load Tx positions for this tile into shared memory
+        if (tid < tx_count) {
+            s_tx_x[tid] = s_xchan[tx_tile + tid];
+        }
+        __syncthreads();
 
-        for (int rx = 0; rx < Nchan; ++rx)
+        // Process all Tx in this tile
+        for (int tx_local = 0; tx_local < tx_count; ++tx_local)
         {
-            // Rx geometry
-            float x_rx  = s_xchan[rx];
-            float dx_rx = px - x_rx;
-            float d_rx  = rsqrtf(dx_rx * dx_rx + pz * pz);
+            int tx = tx_tile + tx_local;
+            float x_tx = s_tx_x[tx_local];
 
-            // Time-of-flight calculation
-            float t        = (d_tx + d_rx) / soundv;
-            float sample_f = (t - timeoffset) * fad * upsamp;
+            // Base pointer for this Tx: rf_transposed[tx][sample][rx]
+            const float* tx_rf_base = rf_transposed + (size_t)tx * Nsample * Nchan;
 
-            int m = (int)(sample_f + 0.5f);
+            // Compute Tx geometry for each pixel
+            float d_tx[PIXELS_PER_THREAD];
+            #pragma unroll
+            for (int p = 0; p < PIXELS_PER_THREAD; ++p) {
+                if (valid[p]) {
+                    float dx_tx = px[p] - x_tx;
+                    d_tx[p] = sqrtf(dx_tx * dx_tx + pz[p] * pz[p]);
+                }
+            }
 
-            // Boundary check
-            if ((unsigned)m < (unsigned)UNsample)
+            // Loop over all Rx
+            for (int rx = 0; rx < Nchan; ++rx)
             {
-                int mm = m / upsamp;
-                int nn = m % upsamp;
+                float x_rx = s_xchan[rx];
 
-                // 9-tap interpolation filter
-                float val = 0.0f;
-
+                // Process each pixel
                 #pragma unroll
-                for (int k = 0; k < 9; ++k)
+                for (int p = 0; p < PIXELS_PER_THREAD; ++p)
                 {
-                    int idx = mm - 4 + k;
-                    if ((unsigned)idx < (unsigned)Nsample)
-                    {
-                        int coeff_idx = nn + 64 - 8 * k;
-                        float coeff = d_Interp[coeff_idx];
+                    if (!valid[p]) continue;
 
-                        // RF access: [tx][idx][rx]
-                        float sample_val = __ldg(&tx_rf_base[idx * Nchan + rx]);
-                        val += sample_val * coeff;
+                    // Rx geometry
+                    float dx_rx = px[p] - x_rx;
+                    float d_rx = sqrtf(dx_rx * dx_rx + pz[p] * pz[p]);
+
+                    // Time-of-flight calculation
+                    float t = (d_tx[p] + d_rx) / soundv;
+                    float sample_f = (t - timeoffset) * fad * upsamp;
+
+                    int m = (int)(sample_f + 0.5f);
+
+                    // Boundary check
+                    if ((unsigned)m < (unsigned)UNsample)
+                    {
+                        int mm = m / upsamp;
+                        int nn = m % upsamp;
+
+                        // 9-tap interpolation filter
+                        float val = 0.0f;
+
+                        #pragma unroll
+                        for (int k = 0; k < 9; ++k)
+                        {
+                            int idx = mm - 4 + k;
+                            if ((unsigned)idx < (unsigned)Nsample)
+                            {
+                                int coeff_idx = nn + 64 - 8 * k;
+                                float coeff = d_Interp[coeff_idx];
+
+                                // RF access: [tx][idx][rx]
+                                float sample_val = __ldg(&tx_rf_base[idx * Nchan + rx]);
+                                val += sample_val * coeff;
+                            }
+                        }
+
+                        total_sum[p] += val;
                     }
                 }
-
-                total_sum += val;
             }
         }
+        __syncthreads();
     }
 
     // --------------------------------------------------------
     // Direct write - NO ATOMIC NEEDED!
     // Each pixel is computed by exactly one thread.
     // --------------------------------------------------------
-    d_beam[jGlobal] = total_sum;
+    #pragma unroll
+    for (int p = 0; p < PIXELS_PER_THREAD; ++p) {
+        if (valid[p]) {
+            int jGlobal = pixel_base + p;
+            d_beam[jGlobal] = total_sum[p];
+        }
+    }
 }
 
 // ============================================================
@@ -239,14 +298,17 @@ void run_beamform(
     std::ofstream fout(beamfile, std::ios::binary);
 
     // --------------------------------------------------------
-    // Kernel Configuration: Pixel-Parallel
+    // Kernel Configuration: Pixel-Parallel with Tiling
     // --------------------------------------------------------
     const int BLOCK_SIZE = 256;
-    int numBlocks = (UNsample + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    // Each thread handles PIXELS_PER_THREAD pixels
+    int total_pixel_threads = (UNsample + PIXELS_PER_THREAD - 1) / PIXELS_PER_THREAD;
+    int numBlocks = (total_pixel_threads + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
-    cout << "\n===== Pixel-Parallel GPU Beamforming =====\n";
-    cout << "UNsample = " << UNsample << ", Blocks = " << numBlocks
-         << ", Threads/Block = " << BLOCK_SIZE << "\n";
+    cout << "\n===== Pixel-Parallel GPU Beamforming (Tiled) =====\n";
+    cout << "UNsample = " << UNsample << ", Pixels/Thread = " << PIXELS_PER_THREAD << "\n";
+    cout << "Blocks = " << numBlocks << ", Threads/Block = " << BLOCK_SIZE << "\n";
+    cout << "Tx Tile Size = " << TX_TILE_SIZE << "\n";
     cout << "Nbeam = " << Nbeam << "\n";
 
     // ========================================================
