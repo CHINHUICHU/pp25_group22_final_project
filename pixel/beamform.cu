@@ -1,11 +1,13 @@
 // ============================================================
-// beamform_atomic.cu
+// beamform_pixel_parallel.cu
 //
 // Optimizations:
-// 1. Memory Coalescing: Transposed RF [Tx][Sample][Rx] (Inherited)
-// 2. Kernel Fusion: Replaced d_partial write + Reduce Kernel
-//    with direct atomicAdd() to d_beam. This saves massive bandwidth.
-// 3. Strict Math: Standard sqrtf/sinf (No fast_math approximations).
+// 1. Pixel-Parallel: Each thread computes ONE pixel completely
+//    - Eliminates ALL atomic operations (was 128 atomics per pixel!)
+//    - Each thread loops over all 128 Tx × 128 Rx internally
+// 2. Shared Memory: xchan loaded into shared memory for fast access
+// 3. Memory Coalescing: Adjacent threads read adjacent pixels
+// 4. Strict Math: Standard sqrtf (No fast_math approximations)
 // ============================================================
 
 #include <cstdio>
@@ -36,18 +38,19 @@ static inline void checkCuda(cudaError_t e, const char* msg)
 }
 
 // ============================================================
-// Kernel: Tx-based + Warp Rx Reduce + ATOMIC Global Accumulate
+// Kernel: Pixel-Parallel Beamforming
 //
-// Grid: (Tx, Pixel_Tiles)
-// Block: (32, J_TILE)
+// Grid: (pixel_tiles)
+// Block: (BLOCK_SIZE)
 //
-// Instead of writing to d_partial, we atomicAdd to d_beam directly.
+// Each thread computes the FULL sum for one pixel (jGlobal).
+// No atomics needed - direct write to d_beam[jGlobal].
 // ============================================================
 __global__ __launch_bounds__(256)
-void beamform_fused_atomic_kernel(
+void beamform_pixel_parallel_kernel(
     const float* __restrict__ rf_transposed, // [Tx][Sample][Rx]
     const float* __restrict__ xchan,
-    float* __restrict__ d_beam,              // Direct output
+    float* __restrict__ d_beam,
     int   Nchan,
     int   Nsample,
     int   UNsample,
@@ -60,105 +63,88 @@ void beamform_fused_atomic_kernel(
     float rangeoffset,
     float drange)
 {
-    int tx   = blockIdx.x;
-    int tile = blockIdx.y;
-    
-    if (tx >= Nchan) return;
+    // Load xchan into shared memory for fast repeated access
+    __shared__ float s_xchan[128];
 
-    int lane   = threadIdx.x; // rx lane (0..31)
-    int jLocal = threadIdx.y;
+    int tid = threadIdx.x;
+    if (tid < Nchan) {
+        s_xchan[tid] = xchan[tid];
+    }
+    __syncthreads();
 
-    int jGlobal = tile * blockDim.y + jLocal;
+    // Each thread handles one pixel
+    int jGlobal = blockIdx.x * blockDim.x + threadIdx.x;
     if (jGlobal >= UNsample) return;
 
     // --------------------------------------------------------
-    // Geometry Calculation (High Precision)
+    // Geometry for this pixel
     // --------------------------------------------------------
     float depth = rangeoffset + jGlobal * drange;
     float px    = depth * sint;
     float pz    = depth * cost;
 
-    float x_tx  = xchan[tx];
-    float dx_tx = px - x_tx;
-    float d_tx  = sqrtf(dx_tx * dx_tx + pz * pz); // Standard sqrtf
-
-    float sum_all_rx = 0.0f;
-    
-    // Base pointer for this Tx in the transposed array
-    // [Tx][Sample][Rx]
-    const float* tx_rf_base = rf_transposed + (size_t)tx * Nsample * Nchan;
+    float total_sum = 0.0f;
 
     // --------------------------------------------------------
-    // Loop over Rx (Warp Parallel)
+    // Loop over ALL Tx and Rx (no atomics needed!)
     // --------------------------------------------------------
-    for (int rxTile = 0; rxTile < Nchan; rxTile += 32)
+    for (int tx = 0; tx < Nchan; ++tx)
     {
-        int rx = rxTile + lane;
-        float contrib = 0.0f;
+        // Tx geometry (computed once per Tx)
+        float x_tx  = s_xchan[tx];
+        float dx_tx = px - x_tx;
+        float d_tx  = rsqrtf(dx_tx * dx_tx + pz * pz);
 
-        if (rx < Nchan)
+        // Base pointer for this Tx: rf_transposed[tx][sample][rx]
+        const float* tx_rf_base = rf_transposed + (size_t)tx * Nsample * Nchan;
+
+        for (int rx = 0; rx < Nchan; ++rx)
         {
-            float x_rx  = xchan[rx];
+            // Rx geometry
+            float x_rx  = s_xchan[rx];
             float dx_rx = px - x_rx;
-            float d_rx  = sqrtf(dx_rx * dx_rx + pz * pz); // Standard sqrtf
+            float d_rx  = rsqrtf(dx_rx * dx_rx + pz * pz);
 
+            // Time-of-flight calculation
             float t        = (d_tx + d_rx) / soundv;
             float sample_f = (t - timeoffset) * fad * upsamp;
 
             int m = (int)(sample_f + 0.5f);
-            
-            // Boundary Check
+
+            // Boundary check
             if ((unsigned)m < (unsigned)UNsample)
             {
                 int mm = m / upsamp;
                 int nn = m % upsamp;
-                
-                // Interpolation
-                if ((unsigned)nn < (unsigned)upsamp)
-                {
-                    float val = 0.0f;
-                    
-                    // Unroll 9-tap filter
-                    #pragma unroll
-                    for (int k = 0; k < 9; ++k)
-                    {
-                        int idx = mm - 4 + k;
-                        // Manual bounds check or assume padding? keeping check for safety
-                        if ((unsigned)idx < (unsigned)Nsample)
-                        {
-                            int coeff_idx = nn + 64 - 8 * k;
-                            float coeff = d_Interp[coeff_idx];
 
-                            // Coalesced Read via Texture Cache (__ldg)
-                            // tx_rf_base is offset by Tx.
-                            // idx * Nchan selects the sample row.
-                            // + rx selects the column.
-                            float sample_val = __ldg(&tx_rf_base[idx * Nchan + rx]);
-                            
-                            val += sample_val * coeff;
-                        }
+                // 9-tap interpolation filter
+                float val = 0.0f;
+
+                #pragma unroll
+                for (int k = 0; k < 9; ++k)
+                {
+                    int idx = mm - 4 + k;
+                    if ((unsigned)idx < (unsigned)Nsample)
+                    {
+                        int coeff_idx = nn + 64 - 8 * k;
+                        float coeff = d_Interp[coeff_idx];
+
+                        // RF access: [tx][idx][rx]
+                        float sample_val = __ldg(&tx_rf_base[idx * Nchan + rx]);
+                        val += sample_val * coeff;
                     }
-                    contrib = val;
                 }
+
+                total_sum += val;
             }
         }
-
-        // Warp Reduction (Sum over 32 Rx lanes)
-        for (int off = 16; off > 0; off >>= 1)
-            contrib += __shfl_down_sync(0xffffffffu, contrib, off);
-
-        if (lane == 0)
-            sum_all_rx += contrib;
     }
 
     // --------------------------------------------------------
-    // ATOMIC ACCUMULATION
-    // Only Lane 0 writes. Multiple Tx blocks add to the same jGlobal.
+    // Direct write - NO ATOMIC NEEDED!
+    // Each pixel is computed by exactly one thread.
     // --------------------------------------------------------
-    if (lane == 0)
-    {
-        atomicAdd(&d_beam[jGlobal], sum_all_rx);
-    }
+    d_beam[jGlobal] = total_sum;
 }
 
 // ============================================================
@@ -181,8 +167,7 @@ void run_beamform(
     // 1. Transpose RF Data [Tx][Rx][Sample] -> [Tx][Sample][Rx]
     // --------------------------------------------------------
     vector<float> rf_transposed((size_t)Nchan * Nchan * Nsample);
-    
-    // CPU Transpose
+
     for (int tx = 0; tx < Nchan; ++tx) {
         for (int k = 0; k < Nsample; ++k) {
             for (int rx = 0; rx < Nchan; ++rx) {
@@ -197,10 +182,10 @@ void run_beamform(
         xchan[i] = (i + 1 - (float)(Nchan + 1) / 2.0f) * p.pitch;
 
     // --------------------------------------------------------
-    // 2. Allocate Memory (NO d_partial needed anymore!)
+    // 2. Allocate GPU Memory
     // --------------------------------------------------------
     float *d_rf = nullptr, *d_xchan = nullptr;
-    float *d_beam[2] = {nullptr, nullptr}; // Only final beam buffer needed
+    float *d_beam[2] = {nullptr, nullptr};
 
     size_t bytes_rf    = rf_transposed.size() * sizeof(float);
     size_t bytes_xchan = Nchan * sizeof(float);
@@ -208,19 +193,18 @@ void run_beamform(
 
     checkCuda(cudaMalloc(&d_rf, bytes_rf), "cudaMalloc d_rf");
     checkCuda(cudaMalloc(&d_xchan, bytes_xchan), "cudaMalloc d_xchan");
-    // Only malloc beam buffers
     checkCuda(cudaMalloc(&d_beam[0], bytes_beam), "cudaMalloc beam0");
     checkCuda(cudaMalloc(&d_beam[1], bytes_beam), "cudaMalloc beam1");
 
     checkCuda(cudaMemcpy(d_rf, rf_transposed.data(), bytes_rf, cudaMemcpyHostToDevice), "Memcpy RF");
     checkCuda(cudaMemcpy(d_xchan, xchan.data(), bytes_xchan, cudaMemcpyHostToDevice), "Memcpy Xchan");
 
-    // Host pinned memory
+    // Host pinned memory for async transfers
     float* h_beam[2] = {nullptr, nullptr};
     checkCuda(cudaMallocHost(&h_beam[0], bytes_beam), "AllocHost h0");
     checkCuda(cudaMallocHost(&h_beam[1], bytes_beam), "AllocHost h1");
 
-    // Constants
+    // Interpolation coefficients
     float Interp[72] = {
         0,-0.0024f,-0.0046f,-0.0061f,-0.0068f,-0.0065f,-0.0052f,-0.0029f,
         0,0.0136f,0.0258f,0.0349f,0.0395f,0.0384f,0.0312f,0.0181f,
@@ -233,7 +217,7 @@ void run_beamform(
     };
     checkCuda(cudaMemcpyToSymbol(d_Interp, Interp, 72 * sizeof(float)), "Const Memcpy");
 
-    // Geometry
+    // Geometry parameters
     float fad        = p.fs;
     float soundv     = p.soundv;
     float timeoffset = p.timeoffset;
@@ -244,6 +228,7 @@ void run_beamform(
     float rangeoffset= timeoffset * soundv / 2.0f;
     int Nbeam        = (int)(std::sqrt(2.0f) / dsin + 0.5f);
 
+    // Streams for double-buffering
     cudaStream_t stream[2];
     cudaEvent_t  done[2];
     for (int i = 0; i < 2; ++i) {
@@ -252,12 +237,17 @@ void run_beamform(
     }
 
     std::ofstream fout(beamfile, std::ios::binary);
-    
-    // Kernel Config
-    const int R_TILE = 32;
-    const int J_TILE = 8;
-    dim3 block(R_TILE, J_TILE);
-    dim3 grid_txj(Nchan, (UNsample + J_TILE - 1) / J_TILE);
+
+    // --------------------------------------------------------
+    // Kernel Configuration: Pixel-Parallel
+    // --------------------------------------------------------
+    const int BLOCK_SIZE = 256;
+    int numBlocks = (UNsample + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    cout << "\n===== Pixel-Parallel GPU Beamforming =====\n";
+    cout << "UNsample = " << UNsample << ", Blocks = " << numBlocks
+         << ", Threads/Block = " << BLOCK_SIZE << "\n";
+    cout << "Nbeam = " << Nbeam << "\n";
 
     // ========================================================
     // Beam Loop
@@ -270,23 +260,20 @@ void run_beamform(
         if (beam < Nbeam)
         {
             float sint = dsin * (beam + 1 - (float)(Nbeam + 1) / 2.0f);
-            if(sint > 1.0f) sint = 1.0f; 
-            if(sint < -1.0f) sint = -1.0f;
+            if (sint > 1.0f) sint = 1.0f;
+            if (sint < -1.0f) sint = -1.0f;
             float cost = std::sqrt(1.f - sint * sint);
 
-            // IMPORTANT: Memset d_beam to 0 before atomic accumulation
-            checkCuda(cudaMemsetAsync(d_beam[cur], 0, bytes_beam, stream[cur]), "Memset Beam");
+            // No memset needed! Each pixel is written exactly once.
 
-            // Fused Kernel
-            beamform_fused_atomic_kernel<<<grid_txj, block, 0, stream[cur]>>>(
-                d_rf, d_xchan, d_beam[cur], // Writing directly to d_beam
+            // Launch pixel-parallel kernel
+            beamform_pixel_parallel_kernel<<<numBlocks, BLOCK_SIZE, 0, stream[cur]>>>(
+                d_rf, d_xchan, d_beam[cur],
                 Nchan, Nsample, UNsample, upsamp,
                 fad, timeoffset, soundv,
                 sint, cost, rangeoffset, drange
             );
 
-            // No Reduce Kernel needed!
-            
             checkCuda(cudaMemcpyAsync(h_beam[cur], d_beam[cur], bytes_beam,
                                       cudaMemcpyDeviceToHost, stream[cur]), "Memcpy DtoH");
 
@@ -302,6 +289,7 @@ void run_beamform(
 
     fout.close();
 
+    // Cleanup
     for (int i = 0; i < 2; ++i) {
         cudaEventDestroy(done[i]);
         cudaStreamDestroy(stream[i]);
@@ -314,6 +302,5 @@ void run_beamform(
     auto T1 = clock::now();
     double sec = std::chrono::duration<double>(T1 - T0).count();
 
-    cout << "\n===== Atomic Fused GPU Beamforming (No Fast Math) =====\n";
     cout << "Total beamforming time = " << sec << " sec\n";
 }
