@@ -51,3 +51,9 @@ sequential/beam_*.dat
 
 # System files
 .DS_Store
+benchmark_results_*.txt
+nsys*
+profile*
+ultrasound*
+build_log.txt
+result/
