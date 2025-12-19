@@ -8,3 +8,9 @@ void run_beamform(
     const std::vector<std::vector<std::vector<float>>>& rf,
     const BFParams& p,
     const char* beamfile);
+
+// OpenMP parallelized version
+void run_beamform_openmp(
+    const std::vector<std::vector<std::vector<float>>>& rf,
+    const BFParams& p,
+    const char* beamfile);

@@ -111,7 +111,11 @@ int main(int argc, char** argv)
 
     // 4) Beamforming
     auto beamform_start = high_resolution_clock::now();
+#ifdef USE_OPENMP
+    run_beamform_openmp(rf, p, beam_file);
+#else
     run_beamform(rf, p, beam_file);
+#endif
     auto beamform_end = high_resolution_clock::now();
     double beamform_time = duration<double>(beamform_end - beamform_start).count();
 
