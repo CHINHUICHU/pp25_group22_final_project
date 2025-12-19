@@ -13,7 +13,7 @@ This project implements an ultrasound image reconstruction pipeline in C++ that 
 
 2. **Build and run:**
    ```bash
-   cd sequential
+   cd pixel
    make run CASE=01 OUT=image01.png
    ```
 
