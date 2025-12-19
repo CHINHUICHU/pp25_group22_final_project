@@ -45,17 +45,18 @@ static inline void checkLastKernel(const char* msg) {
 }
 
 // ------------------------------------------------------------
-// BASELINE Kernel: Simple 1D parallelization over output samples
-// Each thread computes ONE output sample across all TX/RX pairs
+// BASELINE Kernel: Matches sequential storage pattern
+// Parallelizes over TX-RX pairs, accumulates to output with atomics
+// This matches the sequential beam->tx->rx->samples loop structure
 // ------------------------------------------------------------
 __global__ void beamform_baseline_kernel(
-    const float* __restrict__ rf_padded,   // [Tx][Rx][SamplePad]
+    const float* __restrict__ rf,          // [Tx][Rx][Nsample] - NO padding, matches sequential
     const float* __restrict__ xchan,       // [Nchan]
     const float* __restrict__ interp,      // [72]
     float* __restrict__ d_beam,            // [UNsample]
     int   Nchan,
+    int   Nsample,
     int   UNsample,
-    int   SamplePad,
     float sf_scale,
     float sf_bias,
     float sint,
@@ -63,53 +64,54 @@ __global__ void beamform_baseline_kernel(
     float rangeoffset,
     float drange)
 {
-    // Simple 1D thread indexing - one thread per output sample
-    int j = blockIdx.x * blockDim.x + threadIdx.x;
-    if (j >= UNsample) return;
+    // Parallelize over TX-RX pairs (matches sequential structure better)
+    int pair_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_pairs = Nchan * Nchan;
+    if (pair_idx >= total_pairs) return;
 
-    // Compute pixel position
-    float depth = rangeoffset + (float)j * drange;
-    float px = depth * sint;
-    float pz = depth * cost;
+    int tx = pair_idx / Nchan;
+    int rx = pair_idx % Nchan;
 
-    float sum = 0.0f;
+    float x_tx = xchan[tx];
+    float x_rx = xchan[rx];
 
-    // Loop over all TX-RX pairs
-    for (int tx = 0; tx < Nchan; ++tx) {
-        // Compute TX distance
-        float dx_tx = px - xchan[tx];
-        float dtx = sqrtf(dx_tx * dx_tx + pz * pz);
+    // Compute RF data base index: rf[tx][rx][k]
+    size_t rf_base = (size_t)tx * (size_t)Nchan * (size_t)Nsample +
+                     (size_t)rx * (size_t)Nsample;
 
-        for (int rx = 0; rx < Nchan; ++rx) {
-            // Compute RX distance
-            float dx_rx = px - xchan[rx];
-            float drx = sqrtf(dx_rx * dx_rx + pz * pz);
+    // Process each output sample with on-the-fly interpolation
+    // This matches sequential pattern but fused to avoid large buff2 array
+    for (int j = 0; j < UNsample; ++j) {
+        float depth = rangeoffset + (float)j * drange;
+        float px = depth * sint;
+        float pz = depth * cost;
 
-            // Compute sample index with upsampling
-            float sf = (dtx + drx) * sf_scale - sf_bias;
-            int m = (int)(sf + 0.5f);
-            if (m < 0 || m >= UNsample) continue;
+        float dx_tx = px - x_tx;
+        float dx_rx = px - x_rx;
 
-            // Get integer and fractional parts
-            int mm = m / 8;  // Integer division (no bit shift)
-            int nn = m % 8;  // Modulo (no bit mask)
+        float d_tx = sqrtf(dx_tx * dx_tx + pz * pz);
+        float d_rx = sqrtf(dx_rx * dx_rx + pz * pz);
 
-            // Access RF data: [tx][rx][sample]
-            size_t stride_tx = (size_t)Nchan * (size_t)SamplePad;
-            size_t stride_rx = (size_t)SamplePad;
-            size_t base = (size_t)tx * stride_tx + (size_t)rx * stride_rx + (size_t)mm;
+        float t = (d_tx + d_rx);
+        float sample_f = t * sf_scale - sf_bias;
+        int m = (int)(sample_f + 0.5f);
 
-            // Simple interpolation (no loop unrolling)
+        if (m >= 0 && m < UNsample) {
+            // Compute interpolated value on-the-fly
+            int mm = m / 8;
+            int nn = m % 8;
+
             float val = 0.0f;
             for (int t = 0; t < 9; ++t) {
-                float c = interp[nn + 64 - 8 * t];
-                val += rf_padded[base + t] * c;  // Regular load (no __ldg)
+                int k = mm + t - 4;
+                float sample = (k >= 0 && k < Nsample) ? rf[rf_base + k] : 0.0f;
+                val += sample * interp[nn + 64 - 8 * t];
             }
-            sum += val;
+
+            // Use atomic add to accumulate (multiple threads write to same output)
+            atomicAdd(&d_beam[j], val);
         }
     }
-
-    d_beam[j] = sum;  // Direct write (no atomic needed since one thread per output)
 }
 
 // ------------------------------------------------------------
@@ -124,17 +126,16 @@ void run_beamform(const vector<vector<vector<float>>>& rf,
     const int Nchan   = p.Nchan;
     const int Nsample = p.Nsample;
     const int UNsample = UPSAMP * Nsample;
-    const int SamplePad = Nsample + 2 * PAD;
 
-    // Prepare padded RF data [tx][rx][k+PAD]
-    vector<float> rf_padded((size_t)Nchan * Nchan * SamplePad, 0.0f);
+    // Flatten RF data [tx][rx][k] - NO padding, matches sequential exactly
+    vector<float> rf_flat((size_t)Nchan * Nchan * Nsample);
     for (int tx = 0; tx < Nchan; ++tx) {
         for (int rxch = 0; rxch < Nchan; ++rxch) {
             for (int k = 0; k < Nsample; ++k) {
-                size_t dst = (size_t)tx * (size_t)Nchan * (size_t)SamplePad
-                           + (size_t)rxch * (size_t)SamplePad
-                           + (size_t)(k + PAD);
-                rf_padded[dst] = rf[tx][rxch][k];
+                size_t dst = (size_t)tx * (size_t)Nchan * (size_t)Nsample
+                           + (size_t)rxch * (size_t)Nsample
+                           + (size_t)k;
+                rf_flat[dst] = rf[tx][rxch][k];
             }
         }
     }
@@ -157,7 +158,7 @@ void run_beamform(const vector<vector<vector<float>>>& rf,
     // Allocate device memory
     float *d_rf = nullptr, *d_xchan = nullptr, *d_interp = nullptr, *d_beam = nullptr;
 
-    size_t bytes_rf   = rf_padded.size() * sizeof(float);
+    size_t bytes_rf   = rf_flat.size() * sizeof(float);
     size_t bytes_beam = (size_t)UNsample * sizeof(float);
 
     checkCuda(cudaMalloc(&d_rf, bytes_rf), "Malloc RF");
@@ -166,7 +167,7 @@ void run_beamform(const vector<vector<vector<float>>>& rf,
     checkCuda(cudaMalloc(&d_beam, bytes_beam), "Malloc Beam");
 
     // Copy data to device (single stream, no pipelining)
-    checkCuda(cudaMemcpy(d_rf, rf_padded.data(), bytes_rf, cudaMemcpyHostToDevice), "H2D RF");
+    checkCuda(cudaMemcpy(d_rf, rf_flat.data(), bytes_rf, cudaMemcpyHostToDevice), "H2D RF");
     checkCuda(cudaMemcpy(d_xchan, xchan.data(), (size_t)Nchan * sizeof(float), cudaMemcpyHostToDevice), "H2D Xchan");
     checkCuda(cudaMemcpy(d_interp, Interp, 72 * sizeof(float), cudaMemcpyHostToDevice), "H2D Interp");
 
@@ -181,9 +182,10 @@ void run_beamform(const vector<vector<vector<float>>>& rf,
     float sf_scale = (p.fs * UPSAMP) / p.soundv;
     float sf_bias  = p.timeoffset * p.fs * UPSAMP;
 
-    // Simple 1D launch configuration (no tiling)
-    int threadsPerBlock = 256;  // Simple choice
-    int blocksPerGrid = (UNsample + threadsPerBlock - 1) / threadsPerBlock;
+    // Launch configuration: parallelize over TX-RX pairs
+    int total_pairs = Nchan * Nchan;
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (total_pairs + threadsPerBlock - 1) / threadsPerBlock;
 
     // Allocate host output (no pinned memory)
     vector<float> h_beam(UNsample);
@@ -207,8 +209,7 @@ void run_beamform(const vector<vector<vector<float>>>& rf,
         // Launch kernel
         beamform_baseline_kernel<<<blocksPerGrid, threadsPerBlock>>>(
             d_rf, d_xchan, d_interp, d_beam,
-            Nchan, UNsample,
-            SamplePad,
+            Nchan, Nsample, UNsample,
             sf_scale, sf_bias,
             sint, cost, rangeoffset, drange);
 
