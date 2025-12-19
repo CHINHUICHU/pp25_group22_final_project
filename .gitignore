@@ -46,8 +46,27 @@ testcase/*.DAT
 
 # Build artifacts
 sequential/ultrasound
+sequential/ultrasound_openmp
 sequential/validate
 sequential/beam_*.dat
+
+# OpenMP benchmark results
+sequential/benchmark_openmp_results.txt
+sequential/benchmark_openmp_results.txt.detailed
+
+# LaTeX compilation artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.bbl
+*.blg
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+*.nav
+*.snm
+*.vrb
 
 # System files
 .DS_Store

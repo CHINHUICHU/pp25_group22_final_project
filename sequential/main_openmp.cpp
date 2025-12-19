@@ -1,4 +1,4 @@
-// main.cpp
+// main_openmp.cpp - uses OpenMP beamforming
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -13,8 +13,8 @@ using namespace std;
 using namespace std::chrono;
 
 // ---------------------------------------------------------
-// 讀 RF 檔案到 rf[tx][rx][sample]，全部用 float 表示
-// 不做 normalize，只是 short→float / float→float
+// Load RF file into rf[tx][rx][sample], all as float
+// No normalization, just short→float / int→float conversion
 // ---------------------------------------------------------
 static vector<vector<vector<float>>> load_rf_cube(
     const char* filename,
@@ -41,7 +41,6 @@ static vector<vector<vector<float>>> load_rf_cube(
     if (fsize != expected) {
         cerr << "[RF] File size mismatch: got " << fsize
              << ", expected " << expected << endl;
-        // 不 exit，先試著讀
     }
 
     cout << "[RF] Reading " << filename
@@ -63,7 +62,7 @@ static vector<vector<vector<float>>> load_rf_cube(
             for (int rx = 0; rx < Nchan; ++rx) {
                 fin.read((char*)tmp.data(), Nsample * sizeof(int32_t));
                 for (int i = 0; i < Nsample; ++i)
-                    rf[tx][rx][i] = (float)tmp[i];   // 直接轉 float
+                    rf[tx][rx][i] = (float)tmp[i];
             }
         }
     }else {
@@ -78,7 +77,7 @@ static vector<vector<vector<float>>> load_rf_cube(
 int main(int argc, char** argv)
 {
     if (argc != 5) {
-        cout << "Usage: ultrasound input.dat params.txt beamout.dat output.png\n";
+        cout << "Usage: ultrasound_openmp input.dat params.txt beamout.dat output.png\n";
         return -1;
     }
 
@@ -89,29 +88,29 @@ int main(int argc, char** argv)
 
     auto pipeline_start = high_resolution_clock::now();
 
-    // 1) 讀取參數
+    // 1) Load parameters
     BFParams p = load_params(txt_file);
 
-    // 2) 讀取 RF (float cube，不做 normalize)
+    // 2) Load RF data (float cube, no normalization)
     auto load_start = high_resolution_clock::now();
     auto rf = load_rf_cube(rf_file, p);
     auto load_end = high_resolution_clock::now();
     double load_time = duration<double>(load_end - load_start).count();
 
-    // 3) Bandpass FIR (1.5–6 MHz, 41-tap)
-    cout << "[Main] Applying 41-tap bandpass (1.5–6 MHz)...\n";
+    // 3) Bandpass FIR (1.5-6 MHz, 41-tap)
+    cout << "[Main] Applying 41-tap bandpass (1.5-6 MHz)...\n";
     auto bandpass_start = high_resolution_clock::now();
     bandpass_apply_all(rf, p.Nchan, p.Nsample,
-                   p.fs,                 // MHz
+                   p.fs,
                    p.has_bp,
-                   p.bp_low,            // MHz
+                   p.bp_low,
                    p.bp_high);
     auto bandpass_end = high_resolution_clock::now();
     double bandpass_time = duration<double>(bandpass_end - bandpass_start).count();
 
-    // 4) Beamforming
+    // 4) Beamforming with OpenMP
     auto beamform_start = high_resolution_clock::now();
-    run_beamform(rf, p, beam_file);
+    run_beamform_openmp(rf, p, beam_file);
     auto beamform_end = high_resolution_clock::now();
     double beamform_time = duration<double>(beamform_end - beamform_start).count();
 

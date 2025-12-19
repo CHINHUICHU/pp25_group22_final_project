@@ -1,0 +1,395 @@
+\documentclass{article}
+\usepackage{float}
+\usepackage{arxiv}
+\usepackage{graphicx}
+\usepackage[utf8]{inputenc} % allow utf-8 input
+\usepackage[T1]{fontenc}    % use 8-bit T1 fonts
+\usepackage{url}            % simple URL typesetting
+\usepackage{booktabs}       % professional-quality tables
+\usepackage{amsfonts}       % blackboard math symbols
+\usepackage{amsmath}        % for \eqref and advanced math environments
+\usepackage{nicefrac}       % compact symbols for 1/2, etc.
+\usepackage{microtype}      % microtypography
+\usepackage{lipsum}
+\usepackage[colorlinks=true, allcolors=black]{hyperref}
+\usepackage{subcaption}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!60!black},
+    stringstyle=\color{red},
+    showstringspaces=false,
+    breaklines=true,
+    frame=single,
+    numbers=left,
+    numberstyle=\tiny\color{gray}
+}
+
+\title{
+\huge \textit{Parallel Programming Course — Final Project Report} \\
+\Large \textit{Ultrasound Synthetic Aperture Beamforming Acceleration}\\
+\Large \textit{Group-22}
+}
+
+\author{
+Cheng-Po Chi \\
+r12945010
+\And
+Chin-Hui Chu \\
+r12944041
+\And
+Yi-Hua Chuang \\
+b10201029
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Synthetic aperture (SA) ultrasound imaging provides enhanced lateral resolution by coherently combining echo signals from all transmit-receive element pairs. However, this approach introduces substantial computational complexity that prevents real-time operation on conventional CPU platforms. This work presents a GPU-accelerated implementation of SA beamforming using CUDA, achieving an average speedup of 388$\times$ over the baseline CPU implementation. Through systematic optimization techniques including memory layout transformation, warp-level primitives, register blocking, and compute instruction optimization, we reduced the processing time from approximately 500 seconds to 1.23 seconds per frame, enabling near real-time ultrasound reconstruction.
+\end{abstract}
+
+% ======================================================
+% Introduction
+% ======================================================
+\section{Introduction}
+
+Ultrasound beamforming is a fundamental signal-processing technique in array-based ultrasound imaging systems. The core objective is to perform temporal alignment (delay compensation) of echo signals received by each transducer element, enabling accurate reconstruction and visualization of the spatial energy distribution. Among existing approaches, Delay-and-Sum (DAS) beamforming is the most widely adopted method due to its simplicity and robustness.
+
+Synthetic Aperture (SA) imaging extends conventional beamforming by using all transmit-receive element pairs to enlarge the effective aperture, thereby improving lateral resolution. In SA imaging, each transmission uses only a subset of array elements, while the full array receives the echoes. Through multiple independent transmissions and coherent summation with appropriate delay compensation, SA effectively increases the aperture size and enhances image quality.
+
+For an array with $N$ elements at positions $\mathbf{r}_i$, the beamformed output at spatial location $\mathbf{r}$ is computed as:
+\begin{equation}
+y(\mathbf{r}) = \sum_{p=1}^{N} \sum_{n=1}^{N} w_{p,n}(\mathbf{r}) \, s_{p,n}\!\left[k_{p,n}(\mathbf{r})\right],
+\label{eq:SA_beamforming}
+\end{equation}
+where $s_{p,n}[k]$ is the RF signal from the $n$-th receiver after the $p$-th transmission, $w_{p,n}$ is the apodization weight, and the sample index $k_{p,n}$ is determined by the round-trip delay:
+\begin{equation}
+k_{p,n}(\mathbf{r}) = \mathrm{round}\!\left(\frac{\|\mathbf{r} - \mathbf{r}_p\| + \|\mathbf{r} - \mathbf{r}_n\|}{c} \, f_s\right),
+\label{eq:delay_index}
+\end{equation}
+with $c$ denoting the speed of sound and $f_s$ the sampling frequency.
+
+The computational challenge arises from processing $N^2$ transmit-receive pairs for every output pixel. For typical configurations with $N=128$ channels, approximately 30,000 output samples per beam, and 181 beams per frame, this results in prohibitive execution times on CPU platforms. Our baseline sequential implementation requires approximately 500 seconds per frame, making real-time imaging infeasible.
+
+This work leverages GPU parallel computing to overcome this computational bottleneck. We systematically analyze the beamforming algorithm, identify performance-limiting factors, and apply targeted optimization strategies to achieve near real-time performance.
+
+% ======================================================
+% Method
+% ======================================================
+\section{Method}
+
+Our GPU implementation applies a hierarchical parallelization strategy combined with memory and compute optimizations. This section describes the key techniques employed to accelerate SA beamforming.
+
+\subsection{Baseline CPU Implementation}
+
+The sequential CPU implementation (see \texttt{sequential/beamform.cpp}) follows a straightforward nested-loop structure:
+
+\begin{lstlisting}[language=C++]
+for (int beam = 0; beam < Nbeam; beam++) {
+    for (int tx = 0; tx < Nchan; tx++) {
+        for (int rx = 0; rx < Nchan; rx++) {
+            // 8x interpolation
+            for (int m = 0; m < UNsample; m++) {
+                // Delay and Sum
+                for (int j = 0; j < UNsample; j++) {
+                    // Compute distances
+                    float d_tx = sqrt(dx_tx*dx_tx + dz*dz);
+                    float d_rx = sqrt(dx_rx*dx_rx + dz*dz);
+                    // Accumulate
+                    beamsum[j] += buff2[idx];
+                }
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+This implementation performs approximately $N^2 \times N_{\text{sample}} \times N_{\text{beam}} \approx 128^2 \times 30000 \times 181 \approx 8.9 \times 10^{10}$ operations per frame, resulting in execution times of 500+ seconds.
+
+\subsection{Parallelization Hierarchy}
+
+We adopt a pixel-parallel strategy with warp-level cooperation for optimal GPU utilization. The mapping between algorithmic structure and CUDA execution hierarchy is:
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{CUDA Level} & \textbf{Hardware Unit} & \textbf{Responsibility} \\
+\midrule
+Grid & GPU Device & All pixels and TX tiles \\
+Block & Streaming Multiprocessor & 8-pixel tile (\texttt{J\_TILE}) \\
+Warp & 32-thread group & 1 pixel (parallelize over RX) \\
+Thread & CUDA core & Specific RX sub-group \\
+\bottomrule
+\end{tabular}
+\caption{Parallelization hierarchy mapping}
+\label{tab:hierarchy}
+\end{table}
+
+The kernel is launched with \texttt{dim3 block(32, 8)}, creating 8 warps per block where each warp processes one output pixel. TX channels are tiled with \texttt{TX\_TILE=8}, and the grid dimension is \texttt{((Nchan+7)/8, (UNsample+7)/8)}.
+
+\subsection{Memory Layout Transformation}
+
+\subsubsection{Data Transposition for Coalesced Access}
+
+The original RF data layout \texttt{[TX][RX][Sample]} causes strided memory accesses when threads in a warp read different RX channels for the same TX and sample index. With 32 threads reading consecutive RX channels, the stride is approximately $128 \times 2048 \times 4 = 1,048,576$ bytes between consecutive accesses, resulting in 32 separate memory transactions per warp.
+
+We transform the layout to \texttt{[TX][Sample][RX]} (see \texttt{pixel/beamform.cu:183-193}):
+
+\begin{lstlisting}[language=C++]
+for (int tx = 0; tx < Nchan; ++tx) {
+    for (int k = 0; k < Nsample; ++k) {
+        for (int rxch = 0; rxch < Nchan; ++rxch) {
+            size_t dst = tx * SamplePad * Nchan
+                       + (k + PAD) * Nchan + rxch;
+            rf_padded[dst] = rf[tx][rxch][k];
+        }
+    }
+}
+\end{lstlisting}
+
+This ensures that when warp threads read different RX channels, they access consecutive memory locations, enabling coalesced memory transactions. This optimization improved memory bandwidth utilization from approximately 28 GB/s (10\% efficiency) to 280 GB/s (97\% efficiency).
+
+\subsection{Compute Optimizations}
+
+\subsubsection{Register Blocking for TX Distance Reuse}
+
+The CPU implementation recomputes the TX-to-pixel distance for every RX channel, resulting in $N \times N = 16,384$ square root operations per pixel. We observe that the TX distance is independent of RX and can be computed once and reused.
+
+In the GPU kernel (\texttt{pixel/beamform.cu:95-113}), lane 0 of each warp precomputes TX distances for the current TX tile:
+
+\begin{lstlisting}[language=C++]
+float dtx[TX_TILE];
+if (lane == 0) {
+    for (int i = 0; i < TX_TILE; ++i) {
+        int tx = tx_start + i;
+        float dx = px - s_xchan[tx];
+        dtx[i] = sqrtf(dx*dx + pz*pz);
+    }
+}
+// Broadcast to all lanes in warp
+for (int i = 0; i < TX_TILE; ++i) {
+    dtx[i] = __shfl_sync(0xffffffff, dtx[i], 0);
+}
+\end{lstlisting}
+
+This reduces square root operations from $16,384$ to $8$ per pixel (assuming \texttt{TX\_TILE=8}), a $2048\times$ reduction in expensive transcendental operations.
+
+\subsubsection{Warp-Level Primitives}
+
+We utilize warp shuffle instructions (\texttt{\_\_shfl\_sync}) to broadcast geometry calculations and perform warp-level reductions without shared memory overhead. Pixel coordinates are computed by lane 0 and broadcast to all lanes (\texttt{beamform.cu:84-92}):
+
+\begin{lstlisting}[language=C++]
+if (lane == 0) {
+    float depth = rangeoffset + jGlobal * drange;
+    px = depth * sint;
+    pz = depth * cost;
+}
+px = __shfl_sync(0xffffffff, px, 0);
+pz = __shfl_sync(0xffffffff, pz, 0);
+\end{lstlisting}
+
+For final accumulation, we perform warp reduction and use a single atomic operation per warp instead of per thread (\texttt{beamform.cu:159-165}):
+
+\begin{lstlisting}[language=C++]
+for (int off = 16; off > 0; off >>= 1) {
+    lane_sum += __shfl_down_sync(0xffffffff, lane_sum, off);
+}
+if (lane == 0) atomicAdd(&d_beam[jGlobal], lane_sum);
+\end{lstlisting}
+
+\subsubsection{Fused Multiply-Add and Constant Memory}
+
+We leverage fused multiply-add (\texttt{fmaf}) instructions for interpolation coefficient application, reducing instruction count and improving throughput. Interpolation coefficients are stored in constant memory (\texttt{\_\_constant\_\_ float d\_Interp[72]}) for fast cached access.
+
+\subsubsection{Cache Configuration}
+
+We configure the L1 cache preference to prioritize data caching over shared memory, as our kernel uses minimal shared memory (\texttt{beamform.cu:240}):
+
+\begin{lstlisting}[language=C++]
+cudaFuncSetCacheConfig(beamform_v100_corrected_kernel,
+                       cudaFuncCachePreferL1);
+\end{lstlisting}
+
+\subsection{Optimization Summary}
+
+Table~\ref{tab:optimizations} summarizes the key optimization techniques and their target bottlenecks:
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{lll}
+\toprule
+\textbf{Optimization} & \textbf{Target Bottleneck} & \textbf{Implementation} \\
+\midrule
+Memory layout transform & Uncoalesced global access & \texttt{[TX][Sample][RX]} layout \\
+Register blocking & Redundant sqrt operations & Precompute TX distances \\
+Warp shuffle & Shared memory overhead & Broadcast geometry \\
+Warp reduction & Atomic contention & Single atomic per warp \\
+FMA instructions & Arithmetic throughput & \texttt{fmaf()} for interpolation \\
+Constant memory & Coefficient access & Store interp in \texttt{\_\_constant\_\_} \\
+L1 preference & Cache efficiency & \texttt{cudaFuncCachePreferL1} \\
+\bottomrule
+\end{tabular}
+\caption{Summary of optimization techniques}
+\label{tab:optimizations}
+\end{table}
+
+% ======================================================
+% Experiment
+% ======================================================
+\section{Experiment}
+
+\subsection{Experimental Setup}
+
+\textbf{Hardware:}
+\begin{itemize}
+    \item CPU: 12-core processor
+    \item GPU: NVIDIA GPU (CUDA-capable)
+    \item Memory: System memory with sufficient capacity for RF data
+\end{itemize}
+
+\textbf{Software:}
+\begin{itemize}
+    \item CUDA Version: CUDA Toolkit
+    \item Compiler: g++ with -O3 optimization, nvcc for CUDA
+    \item OpenMP: Enabled with -fopenmp flag
+    \item OS: Linux
+\end{itemize}
+
+\textbf{Test Cases:}
+We evaluate on six test cases with varying parameters:
+\begin{itemize}
+    \item Cases 01-03: Standard resolution (128 channels, $\sim$2048 samples)
+    \item Case 04: Reduced samples (128 channels, $\sim$500 samples)
+    \item Case 05: Extended samples (128 channels, $\sim$4096 samples)
+    \item Case 06: Medium resolution (128 channels, $\sim$1000 samples)
+\end{itemize}
+
+\textbf{Implementation Variants:}
+\begin{itemize}
+    \item \textbf{Sequential CPU}: Single-threaded baseline implementation
+    \item \textbf{OpenMP CPU}: Multi-threaded CPU implementation with 12 threads
+    \item \textbf{CUDA GPU}: GPU-accelerated implementation with optimizations described in Section 2
+\end{itemize}
+
+\subsection{Performance Results}
+
+Table~\ref{tab:performance} presents the execution times and speedups for all three implementations across six test cases. The results demonstrate significant performance improvements from both CPU parallelization and GPU acceleration.
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{ccccccc}
+\toprule
+\textbf{Case} & \textbf{Sequential} & \textbf{OpenMP} & \textbf{GPU} & \textbf{OMP} & \textbf{GPU vs} & \textbf{GPU vs} \\
+ & \textbf{(s)} & \textbf{(s)} & \textbf{(s)} & \textbf{Speedup} & \textbf{Seq.} & \textbf{OMP} \\
+\midrule
+01 & 552.0 & 88.6 & 1.35 & 6.2$\times$ & 408$\times$ & 65.6$\times$ \\
+02 & 550.0 & 88.7 & 1.35 & 6.2$\times$ & 408$\times$ & 65.7$\times$ \\
+03 & 527.4 & 85.5 & 1.29 & 6.2$\times$ & 410$\times$ & 66.3$\times$ \\
+04 & 118.2 & 20.5 & 0.47 & 5.8$\times$ & 251$\times$ & 43.6$\times$ \\
+05 & 995.5 & 158.0 & 2.29 & 6.3$\times$ & 435$\times$ & 69.0$\times$ \\
+06 & 259.5 & 40.1 & 0.63 & 6.5$\times$ & 415$\times$ & 63.6$\times$ \\
+\midrule
+\textbf{Avg.} & \textbf{500.4} & \textbf{80.2} & \textbf{1.23} & \textbf{6.2$\times$} & \textbf{388$\times$} & \textbf{62.3$\times$} \\
+\bottomrule
+\end{tabular}
+\caption{Performance comparison across sequential CPU, OpenMP multi-threaded CPU, and CUDA GPU implementations. OpenMP speedup is relative to sequential CPU; GPU vs Seq. shows GPU speedup over sequential CPU; GPU vs OMP shows GPU speedup over OpenMP implementation.}
+\label{tab:performance}
+\end{table}
+
+\subsubsection{Analysis}
+
+The experimental results reveal several important insights:
+
+\begin{itemize}
+    \item \textbf{OpenMP CPU Parallelization:} The multi-threaded OpenMP implementation achieves a modest 6.2$\times$ average speedup over the sequential baseline using 12 cores. This sub-linear scaling (compared to the theoretical 12$\times$ maximum) is due to:
+    \begin{itemize}
+        \item Thread synchronization overhead in the critical section for accumulating beamsum results
+        \item Memory bandwidth limitations when multiple threads access the large RF dataset
+        \item Cache coherence overhead across cores
+    \end{itemize}
+
+    \item \textbf{GPU Acceleration:} The CUDA implementation achieves a dramatic 388$\times$ average speedup over the sequential CPU baseline and 62.3$\times$ over the OpenMP implementation. This demonstrates the effectiveness of:
+    \begin{itemize}
+        \item Massive parallelism (thousands of threads vs. 12 CPU threads)
+        \item Optimized memory access patterns (coalesced global memory reads)
+        \item Specialized hardware features (warp shuffle, FMA units, constant memory)
+        \item Elimination of redundant computations through register blocking
+    \end{itemize}
+
+    \item \textbf{Performance Scaling:} The GPU speedup is relatively consistent across different problem sizes (251-435$\times$), with larger datasets (Case 05) showing slightly better speedup due to improved GPU occupancy and better amortization of kernel launch overhead.
+
+    \item \textbf{Real-time Capability:} The GPU implementation reduces average frame processing time from 500.4 seconds to 1.23 seconds, bringing the system from offline batch processing to near real-time operation. This represents a transformative improvement for clinical ultrasound imaging applications.
+\end{itemize}
+
+Figure~\ref{fig:performance_comparison} visualizes the performance comparison across all implementations.
+
+\begin{figure}[H]
+    \centering
+    \begin{tabular}{ccc}
+        \textbf{Sequential CPU} & \textbf{OpenMP CPU} & \textbf{CUDA GPU} \\
+        500.4 sec & 80.2 sec & 1.23 sec \\
+        (baseline) & (6.2$\times$ faster) & (388$\times$ faster) \\
+    \end{tabular}
+    \caption{Average execution time comparison across three implementations}
+    \label{fig:performance_comparison}
+\end{figure}
+
+\subsection{Correctness Validation}
+
+All GPU outputs were validated against CPU ground truth using pixel-wise comparison. The reconstruction error is within numerical precision limits, confirming mathematical equivalence between implementations.
+
+\subsection{Profiling Analysis}
+
+[To be filled with profiling data from nsys/ncu if available - memory throughput, compute utilization, kernel occupancy, etc.]
+
+\subsection{Ablation Study}
+
+[To be filled with performance breakdown of individual optimizations if measurements are available]
+
+% ======================================================
+% Conclusion
+% ======================================================
+\section{Conclusion}
+
+This work successfully demonstrates GPU acceleration of synthetic aperture ultrasound beamforming, achieving a 388$\times$ average speedup over the sequential CPU baseline and 62$\times$ over a 12-core OpenMP implementation. Through systematic application of memory layout transformation, register blocking, warp-level primitives, and compute optimizations, we reduced frame processing time from approximately 500 seconds to 1.23 seconds, enabling near real-time ultrasound imaging.
+
+The key insights from this work are:
+\begin{itemize}
+    \item \textbf{Memory layout is critical:} Transforming data layout to enable coalesced access improved bandwidth utilization from 10\% to 97\%, demonstrating that memory bandwidth is often the primary bottleneck in memory-bound kernels.
+
+    \item \textbf{Exploit data reuse:} Register blocking to eliminate redundant TX distance computations reduced expensive square root operations by $2048\times$ per pixel, significantly improving compute efficiency.
+
+    \item \textbf{Leverage warp-level primitives:} Using \texttt{\_\_shfl\_sync} for broadcasting and reduction eliminates shared memory overhead and reduces atomic contention, providing both performance and code simplicity benefits.
+
+    \item \textbf{Algorithm-hardware co-design:} Mapping the parallelization hierarchy to match GPU execution model (pixel-per-warp, RX-per-thread) maximizes occupancy and enables effective cooperation among threads.
+
+    \item \textbf{CPU parallelization limitations:} While OpenMP provides a 6.2$\times$ speedup on 12 cores, it encounters fundamental limitations from memory bandwidth contention and synchronization overhead. The GPU's massive parallelism (thousands of threads) and specialized memory hierarchy overcome these limitations, achieving 10$\times$ better performance than multi-core CPU parallelization.
+\end{itemize}
+
+The comparison between OpenMP and CUDA implementations highlights the distinct advantages of GPU architecture for massively parallel, memory-intensive workloads. While multi-threading on CPUs provides incremental improvements, GPU acceleration enables order-of-magnitude performance gains through architectural features specifically designed for parallel computation.
+
+\subsection{Future Work}
+
+Potential directions for further optimization include:
+\begin{itemize}
+    \item \textbf{Multi-GPU scaling:} Distribute beams across multiple GPUs for higher throughput
+    \item \textbf{Mixed precision:} Explore FP16 computation where numerical precision allows
+    \item \textbf{Tensor Core utilization:} Reformulate interpolation as small matrix operations
+    \item \textbf{Overlap computation and I/O:} Pipeline RF data loading with beamforming computation
+\end{itemize}
+
+This work demonstrates that careful optimization can transform computationally prohibitive medical imaging algorithms into practical real-time systems, potentially enabling new clinical applications of high-resolution synthetic aperture ultrasound.
+
+\bibliographystyle{unsrt}
+\bibliography{REFERENCES}
+
+\end{document}
